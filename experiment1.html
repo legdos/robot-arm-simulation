@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>机械臂仿真 - 任务a+b (局部Y轴)</title>
+    <style>body { margin: 0; overflow: hidden; }</style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+            "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js"
+        }
+    }
+    </script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import GUI from 'lil-gui';
+
+// ===== 场景 =====
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111122);
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 1000);
+camera.position.set(4, 3, 5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0x404060));
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(5, 10, 5);
+dirLight.castShadow = true;
+scene.add(dirLight);
+scene.add(new THREE.GridHelper(10, 20, 0x88aaff, 0x446688));
+scene.add(new THREE.AxesHelper(1));
+
+// ===== 关节配置（全部绕局部 +Y）=====
+const jointConfig = [
+    { name: 'j1', limit: 180 },
+    { name: 'j2', limit: 120 },
+    { name: 'j3', limit: 120 },
+    { name: 'j4', limit: 120 },
+    { name: 'j5', limit: 180 }
+];
+
+// 所有关节统一使用局部 Y 轴正方向
+const LOCAL_AXIS = new THREE.Vector3(0, 1, 0);
+
+const jointMap = new Map();
+const jointState = {};
+let tcpNode = null;
+let robotModel = null;
+
+// ===== 加载模型 =====
+new GLTFLoader().load(
+    './images/robot_articulated.glb',
+    (gltf) => {
+        robotModel = gltf.scene;
+        robotModel.traverse(c => {
+            if (c.isMesh) {
+                c.castShadow = true;
+                c.receiveShadow = true;
+            }
+        });
+        scene.add(robotModel);
+        console.log('模型加载成功');
+
+        robotModel.updateWorldMatrix(true, true);
+
+        robotModel.traverse((node) => {
+            const lowerName = node.name.toLowerCase();
+            const cfg = jointConfig.find(c => c.name === lowerName);
+            if (cfg) {
+                jointMap.set(cfg.name, {
+                    node: node,
+                    lower: THREE.MathUtils.degToRad(-cfg.limit),
+                    upper: THREE.MathUtils.degToRad(cfg.limit),
+                    basePos: node.position.clone(),
+                    baseQuat: node.quaternion.clone()
+                });
+                console.log(`缓存 ${cfg.name} 成功`);
+            }
+            if (lowerName === 'tcp') tcpNode = node;
+        });
+
+        console.log('jointMap 数量:', jointMap.size);
+        initTeachPendant();
+    },
+    undefined,
+    err => console.error('模型加载失败', err)
+);
+
+function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+}
+
+// ★ 核心：模型零位 + 绕局部 +Y 旋转
+function setJoint(name, angleRad) {
+    const j = jointMap.get(name);
+    if (!j) return;
+
+    const q = clamp(angleRad, j.lower, j.upper);
+
+    // 1. 恢复零位
+    j.node.position.copy(j.basePos);
+    j.node.quaternion.copy(j.baseQuat);
+
+    // 2. 绕局部 Y 轴旋转
+    const motionQ = new THREE.Quaternion().setFromAxisAngle(LOCAL_AXIS, q);
+    j.node.quaternion.multiply(motionQ);
+
+    // 3. 更新子树
+    j.node.updateMatrixWorld(true);
+}
+
+let poseInfo = { x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0, quat: '0,0,0,1' };
+const teachState = {
+    estop: false,
+    speedRatio: 1.0,
+    enableJ1: true, enableJ2: true, enableJ3: true, enableJ4: true, enableJ5: true,
+    jogDir: 0
+};
+
+// ===== 三点法标定 =====
+const calib = {
+    points: [],
+    userFrame: null,
+    userFrameInv: null,
+    recordedCount: 0
+};
+
+function recordCalibPoint(label) {
+    if (!tcpNode) return;
+    tcpNode.updateWorldMatrix(true, true);
+    const pos = new THREE.Vector3();
+    tcpNode.matrixWorld.decompose(pos, new THREE.Quaternion(), new THREE.Vector3());
+    calib.points.push(pos.clone());
+    calib.recordedCount++;
+    console.log(`记录 ${label}: (${pos.x.toFixed(4)}, ${pos.y.toFixed(4)}, ${pos.z.toFixed(4)})`);
+    if (calib.recordedCount === 3) computeUserFrame();
+}
+
+function computeUserFrame() {
+    const [P0, Px, Py] = calib.points;
+    const O = P0.clone();
+    const X = new THREE.Vector3().copy(Px).sub(O).normalize();
+    const tempY = new THREE.Vector3().copy(Py).sub(O).normalize();
+    const Z = new THREE.Vector3().crossVectors(X, tempY).normalize();
+    const Y = new THREE.Vector3().crossVectors(Z, X).normalize();
+
+    const m = new THREE.Matrix4().set(
+        X.x, Y.x, Z.x, O.x,
+        X.y, Y.y, Z.y, O.y,
+        X.z, Y.z, Z.z, O.z,
+        0, 0, 0, 1
+    );
+    calib.userFrame = m;
+    calib.userFrameInv = m.clone().invert();
+    console.log('用户坐标系标定完成');
+}
+
+function getTCPInUserFrame() {
+    if (!tcpNode || !calib.userFrameInv) return null;
+    tcpNode.updateWorldMatrix(true, true);
+    const worldPos = new THREE.Vector3();
+    tcpNode.matrixWorld.decompose(worldPos, new THREE.Quaternion(), new THREE.Vector3());
+    return worldPos.applyMatrix4(calib.userFrameInv);
+}
+
+// ===== MOVJ =====
+const programPoses = [
+    [0, 30, 0, 0, 0],
+    [15, 40, 0, 0, 0],
+    [30, 30, 0, 0, 0],
+    [15, 20, 0, 0, 0],
+    [0, 30, 0, 0, 0],
+    [-15, 40, 0, 0, 0],
+    [-30, 30, 0, 0, 0],
+    [-15, 20, 0, 0, 0],
+    [0, 30, 0, 0, 0]
+];
+
+let isRunningProgram = false;
+let movjProgress = 0;
+let currentSeg = 0;
+let prevPose = [];
+let targetPose = [];
+
+function startMOVJ() {
+    if (isRunningProgram) return;
+    isRunningProgram = true;
+    teachState.estop = false;
+    currentSeg = 0;
+    movjProgress = 0;
+    prevPose = programPoses[0].slice();
+    targetPose = programPoses[1].slice();
+    console.log('开始 MOVJ');
+}
+
+function updateMOVJ(dt) {
+    if (!isRunningProgram || teachState.estop) return;
+    movjProgress += dt * 0.4 * teachState.speedRatio;
+    if (movjProgress >= 1) {
+        movjProgress = 0;
+        currentSeg++;
+        if (currentSeg >= programPoses.length - 1) {
+            isRunningProgram = false;
+            console.log('MOVJ 执行完毕');
+            return;
+        }
+        prevPose = programPoses[currentSeg].slice();
+        targetPose = programPoses[currentSeg + 1].slice();
+    }
+    const cur = prevPose.map((p, i) => THREE.MathUtils.lerp(p, targetPose[i], movjProgress));
+    cur.forEach((deg, i) => {
+        const name = jointConfig[i].name;
+        jointState[name] = deg;
+        setJoint(name, THREE.MathUtils.degToRad(deg));
+    });
+}
+
+// ===== 示教器 =====
+function initTeachPendant() {
+    const gui = new GUI({ title: '虚拟示教器' });
+
+    jointConfig.forEach(cfg => {
+        jointState[cfg.name] = 0;
+        gui.add(jointState, cfg.name, -cfg.limit, cfg.limit, 0.1)
+            .name(`${cfg.name.toUpperCase()} (°)` )
+            .onChange(v => {
+                if (!teachState.estop && !isRunningProgram) {
+                    setJoint(cfg.name, THREE.MathUtils.degToRad(v));
+                }
+            });
+    });
+
+    gui.add(teachState, 'estop').name('急停');
+    gui.add(teachState, 'speedRatio', 0.1, 1.0, 0.1).name('速度倍率');
+    ['J1', 'J2', 'J3', 'J4', 'J5'].forEach(n =>
+        gui.add(teachState, `enable${n}`).name(`${n}使能`)
+    );
+    gui.add({ jogPos: () => teachState.jogDir = 1 }, 'jogPos').name('Jog +');
+    gui.add({ jogNeg: () => teachState.jogDir = -1 }, 'jogNeg').name('Jog -');
+    gui.add({ jogStop: () => teachState.jogDir = 0 }, 'jogStop').name('Jog 停');
+
+    const calibFolder = gui.addFolder('三点法标定用户坐标系');
+    calibFolder.add({ f: () => recordCalibPoint('P0') }, 'f').name('① 记录 P0');
+    calibFolder.add({ f: () => recordCalibPoint('Px') }, 'f').name('② 记录 Px');
+    calibFolder.add({ f: () => recordCalibPoint('Py') }, 'f').name('③ 记录 Py');
+    calibFolder.add({
+        f: () => {
+            calib.points = [];
+            calib.recordedCount = 0;
+            calib.userFrame = null;
+            calib.userFrameInv = null;
+            console.log('标定已重置');
+        }
+    }, 'f').name('重置标定');
+
+    const userCoord = { ux: 0, uy: 0, uz: 0 };
+    calibFolder.add(userCoord, 'ux').name('用户X').listen().disable();
+    calibFolder.add(userCoord, 'uy').name('用户Y').listen().disable();
+    calibFolder.add(userCoord, 'uz').name('用户Z').listen().disable();
+    window._userCoordUI = userCoord;
+
+    const progFolder = gui.addFolder('MOVJ 程序');
+    progFolder.add({ run: () => startMOVJ() }, 'run').name('▶ 执行');
+    progFolder.add({
+        stop: () => {
+            isRunningProgram = false;
+            teachState.estop = true;
+        }
+    }, 'stop').name('■ 停止');
+
+    const poseFolder = gui.addFolder('末端位姿 TCP');
+    poseInfo = { x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0, quat: '0,0,0,1' };
+    ['x', 'y', 'z', 'roll', 'pitch', 'yaw', 'quat'].forEach(k =>
+        poseFolder.add(poseInfo, k).listen().disable()
+    );
+}
+
+// ===== TCP 显示 =====
+const _pos = new THREE.Vector3(), _quat = new THREE.Quaternion(), _euler = new THREE.Euler();
+function updatePose() {
+    if (!tcpNode) return;
+    tcpNode.updateWorldMatrix(true, true);
+    tcpNode.matrixWorld.decompose(_pos, _quat, new THREE.Vector3());
+    _euler.setFromQuaternion(_quat, 'XYZ');
+    poseInfo.x = _pos.x.toFixed(4);
+    poseInfo.y = _pos.y.toFixed(4);
+    poseInfo.z = _pos.z.toFixed(4);
+    poseInfo.roll = THREE.MathUtils.radToDeg(_euler.x).toFixed(2);
+    poseInfo.pitch = THREE.MathUtils.radToDeg(_euler.y).toFixed(2);
+    poseInfo.yaw = THREE.MathUtils.radToDeg(_euler.z).toFixed(2);
+    poseInfo.quat = `${_quat.x.toFixed(3)}, ${_quat.y.toFixed(3)}, ${_quat.z.toFixed(3)}, ${_quat.w.toFixed(3)}`;
+
+    if (calib.userFrameInv && window._userCoordUI) {
+        const p = getTCPInUserFrame();
+        if (p) {
+            window._userCoordUI.ux = p.x.toFixed(4);
+            window._userCoordUI.uy = p.y.toFixed(4);
+            window._userCoordUI.uz = p.z.toFixed(4);
+        }
+    }
+}
+
+// ===== 循环 =====
+let lastTime = 0;
+(function animate(time) {
+    requestAnimationFrame(animate);
+    const dt = lastTime ? (time - lastTime) / 1000 : 0.016;
+    lastTime = time;
+
+    controls.update();
+
+    if (teachState.jogDir !== 0 && !teachState.estop && !isRunningProgram) {
+        const step = teachState.jogDir * teachState.speedRatio * 40 * dt;
+        jointConfig.forEach(cfg => {
+            if (teachState[`enable${cfg.name.toUpperCase()}`]) {
+                jointState[cfg.name] = clamp(
+                    jointState[cfg.name] + step,
+                    -cfg.limit,
+                    cfg.limit
+                );
+                setJoint(cfg.name, THREE.MathUtils.degToRad(jointState[cfg.name]));
+            }
+        });
+    }
+
+    updateMOVJ(dt);
+    if (robotModel && tcpNode) updatePose();
+    renderer.render(scene, camera);
+})();
+</script>
+</body>
+</html>
